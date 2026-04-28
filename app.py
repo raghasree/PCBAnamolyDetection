@@ -16,6 +16,7 @@ from PIL import Image
 import torch
 import torch.nn.functional as F
 from torchvision import transforms
+from pathlib import Path   # ← ADD this line
 
 warnings.filterwarnings("ignore")
 
@@ -56,6 +57,11 @@ _AE_TRANSFORM = transforms.Compose([
 # ─────────────────────────────────────────────────────────────────────────────
 @st.cache_resource
 def load_phase1_model():
+    if not AE_CHECKPOINT.exists():
+        raise FileNotFoundError(
+            f"ae_model.pth not found at: {AE_CHECKPOINT.resolve()} — "
+            f"make sure outputs/ae_model.pth is committed to GitHub."
+        )
     return load_ae(AE_CHECKPOINT, device=CFG.device)
 
 
