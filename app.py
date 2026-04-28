@@ -20,6 +20,52 @@ from torchvision import transforms
 from pathlib import Path   # ← ADD this line
 
 warnings.filterwarnings("ignore")
+# ─────────────────────────────────────────────────────────────────────────────
+# PCB VALIDATOR — heuristic check before running the pipeline
+# ─────────────────────────────────────────────────────────────────────────────
+import cv2
+
+import base64
+import requests
+from io import BytesIO
+
+import torch
+from torchvision import transforms
+from PIL import Image
+
+# Load once globally
+@st.cache_resource
+def load_pcb_classifier():
+    import timm
+    model = timm.create_model("mobilenetv3_small_100", pretrained=False, num_classes=2)
+    model.load_state_dict(torch.load("pcb_classifier.pth", map_location="cpu"))
+    model.eval()
+    return model
+
+PCB_MODEL = load_pcb_classifier()
+
+PCB_CLASSES = ["non_pcb", "pcb"]
+
+PCB_TRANSFORM = transforms.Compose([
+    transforms.Resize((224, 224)),
+    transforms.ToTensor(),
+])
+
+def is_pcb_image(img_pil, threshold=0.80):
+    x = PCB_TRANSFORM(img_pil).unsqueeze(0)
+
+    with torch.no_grad():
+        out = PCB_MODEL(x)
+        probs = torch.softmax(out, dim=1)[0]
+
+    pred = probs.argmax().item()
+    confidence = probs[pred].item()
+
+    label = PCB_CLASSES[pred]
+
+    is_pcb = (label == "pcb") and (confidence > threshold)
+
+    return is_pcb, label, confidence  # need at least 2/4 signals
 
 st.set_page_config(
     page_title="PCB Defect Detection",
@@ -209,6 +255,27 @@ if not uploaded:
     st.stop()
 
 img_pil = Image.open(uploaded).convert("RGB")
+
+# ── PCB Validation ────────────────────────────────────────────────────────────
+st.markdown("---")
+st.subheader("🟢 Pre-check — Is this a PCB image?")
+
+with st.spinner("Validating image…"):
+    pcb_valid, pcb_label, pcb_conf = is_pcb_image(img_pil)
+
+col_img, col_result = st.columns(2)
+with col_img:
+    st.image(img_pil, caption="Uploaded Image", use_container_width=True)
+with col_result:
+    st.metric("Prediction", pcb_label.upper())
+    st.metric("Confidence", f"{pcb_conf:.1%}")
+
+    if pcb_valid:
+        st.success("✅ PCB detected — proceeding to Phase 1 & 2")
+    else:
+        st.error("❌ Not a PCB image")
+        st.warning("Upload a proper PCB image")
+        st.stop()    # ← HARD STOP: nothing below runs
 
 # ─────────────────────────────────────────────────────────────────────────────
 # PHASE 1
