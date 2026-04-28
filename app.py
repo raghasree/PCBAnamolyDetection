@@ -6,6 +6,7 @@ Phase 2 : MobileViT-S classification → Defect type + Grad-CAM + Bbox
 """
 
 import io
+import os
 import warnings
 import numpy as np
 import matplotlib
@@ -42,7 +43,7 @@ except ImportError as e:
 # ─────────────────────────────────────────────────────────────────────────────
 # CONSTANTS
 # ─────────────────────────────────────────────────────────────────────────────
-AE_CHECKPOINT = CFG.output_dir.parent / "ae_model.pth"
+AE_CHECKPOINT = Path(os.getenv("AE_CHECKPOINT", "outputs/ae_model.pth"))
 AE_IMG_SIZE   = 128
 AE_THRESHOLD  = 0.01
 
