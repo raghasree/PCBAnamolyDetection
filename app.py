@@ -1,13 +1,17 @@
-"""
-PCB Defect Detection — Streamlit App (Two-Phase Pipeline)
-==========================================================
-Phase 1 : Autoencoder reconstruction error → Normal vs Anomaly
-Phase 2 : MobileViT-S classification → Defect type + Grad-CAM + Bbox
+﻿"""
+PCB Defect Detection - Streamlit App (Three-Phase Pipeline)
+===========================================================
+Phase 0 : PCB Validator      - MobileNetV3 binary classifier (PCB vs Non-PCB)
+Phase 1 : Autoencoder        - Reconstruction error -> Normal vs Anomaly
+Phase 2 : MobileViT-S        - Defect type + Grad-CAM + Bounding Box + Gemini Explanation
+Explanation: Google Gemini API (free tier) via plain requests -- no openai package needed.
 """
 
 import io
 import os
+import json
 import warnings
+import requests
 import numpy as np
 import matplotlib
 matplotlib.use("Agg")
@@ -17,65 +21,130 @@ from PIL import Image
 import torch
 import torch.nn.functional as F
 from torchvision import transforms
-from pathlib import Path   # ← ADD this line
+from pathlib import Path
 
 warnings.filterwarnings("ignore")
-# ─────────────────────────────────────────────────────────────────────────────
-# PCB VALIDATOR — heuristic check before running the pipeline
-# ─────────────────────────────────────────────────────────────────────────────
-import cv2
+# ---------------------------------------------------------------------------
+# HUGGING FACE CONFIG (UPDATED)
+# ---------------------------------------------------------------------------
+HF_TOKEN = os.environ.get("HF_TOKEN")  # MUST set in environment
 
-import base64
-import requests
-from io import BytesIO
+HF_MODELS = [
+    "google/flan-t5-base",
+    "google/flan-t5-large",
+]
 
-import torch
-from torchvision import transforms
-from PIL import Image
+HF_BASE = "https://api-inference.huggingface.co/models/"
+MAX_RETRIES = 5
+BACKOFF = 2
 
-# Load once globally
-@st.cache_resource
-def load_pcb_classifier():
-    import timm
-    model = timm.create_model("mobilenetv3_small_100", pretrained=False, num_classes=2)
-    model.load_state_dict(torch.load("pcb_classifier.pth", map_location="cpu"))
-    model.eval()
-    return model
 
-PCB_MODEL = load_pcb_classifier()
+# ---------------------------------------------------------------------------
+# FALLBACK EXPLANATION (NEVER FAILS)
+# ---------------------------------------------------------------------------
+def fallback_explanation(label: str, confidence: float) -> str:
+    return f"""
+Defect Type: {label.replace('_',' ').title()}
+Confidence: {confidence:.1%}
 
-PCB_CLASSES = ["non_pcb", "pcb"]
+1. What is this defect?
+This defect indicates an irregularity in the PCB layout or manufacturing process that may affect circuit performance and reliability.
 
-PCB_TRANSFORM = transforms.Compose([
-    transforms.Resize((224, 224)),
-    transforms.ToTensor(),
-])
+2. Possible causes:
+- Misalignment during drilling or etching
+- Over-etching or under-etching of copper layers
+- Material contamination or defects
+- Improper fabrication calibration
 
-def is_pcb_image(img_pil, threshold=0.80):
-    x = PCB_TRANSFORM(img_pil).unsqueeze(0)
+3. Recommended corrective actions:
+- Perform visual and electrical inspection
+- Recalibrate manufacturing equipment
+- Improve quality control checks
+- Use higher precision fabrication settings
+"""
 
-    with torch.no_grad():
-        out = PCB_MODEL(x)
-        probs = torch.softmax(out, dim=1)[0]
 
-    pred = probs.argmax().item()
-    confidence = probs[pred].item()
+# ---------------------------------------------------------------------------
+# HUGGING FACE EXPLANATION ENGINE (ROBUST VERSION)
+# ---------------------------------------------------------------------------
+def generate_explanation(label: str, confidence: float) -> str:
+    import time
 
-    label = PCB_CLASSES[pred]
+    if not HF_TOKEN:
+        return fallback_explanation(label, confidence) + "\n\n(HF token not set)"
 
-    is_pcb = (label == "pcb") and (confidence > threshold)
+    prompt = (
+        f"You are an expert PCB manufacturing engineer.\n\n"
+        f"Defect detected: {label.replace('_', ' ')}\n"
+        f"Confidence: {confidence:.1%}\n\n"
+        f"Provide:\n"
+        f"1. Explanation\n"
+        f"2. Causes\n"
+        f"3. Corrective actions\n"
+    )
 
-    return is_pcb, label, confidence  # need at least 2/4 signals
+    headers = {"Authorization": f"Bearer {HF_TOKEN}"}
 
+    for model in HF_MODELS:
+        url = HF_BASE + model
+
+        payload = {
+            "inputs": prompt,
+            "parameters": {
+                "max_new_tokens": 300,
+                "temperature": 0.3,
+                "return_full_text": False,
+            },
+        }
+
+        for attempt in range(MAX_RETRIES):
+            try:
+                resp = requests.post(url, headers=headers, json=payload, timeout=60)
+
+                # -------------------------
+                # Handle API states
+                # -------------------------
+                if resp.status_code == 503:
+                    time.sleep(BACKOFF ** attempt)
+                    continue
+
+                if resp.status_code == 429:
+                    time.sleep(BACKOFF ** attempt)
+                    continue
+
+                if resp.status_code == 404:
+                    break  # try next model
+
+                if resp.status_code == 401:
+                    return fallback_explanation(label, confidence) + "\n\n(Invalid HF token)"
+
+                resp.raise_for_status()
+                data = resp.json()
+
+                if isinstance(data, list) and len(data) > 0:
+                    text = data[0].get("generated_text", "").strip()
+                    if text:
+                        return f"[Model: {model.split('/')[-1]}]\n\n{text}"
+
+            except requests.exceptions.Timeout:
+                continue
+            except Exception:
+                break
+
+    # If everything fails → fallback
+    return fallback_explanation(label, confidence) + "\n\n(HF servers busy, fallback used)"
+#------------
+# PAGE CONFIG  (must be first Streamlit call)
+# ---------------------------------------------------------------------------
 st.set_page_config(
     page_title="PCB Defect Detection",
-    page_icon="🔍",
+    page_icon=":mag:",
     layout="wide",
 )
 
-# ─────────────────────────────────────────────────────────────────────────────
-# IMPORTS
-# ─────────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# IMPORTS from project modules
+# ---------------------------------------------------------------------------
 try:
     from test import (PCBViT, CFG, load_checkpoint, predict_tta,
                       get_gradcam_target_layer, GradCAM,
@@ -83,13 +152,13 @@ try:
     from ae_model import AutoEncoderFlat, load_ae, reconstruction_error
     import cv2
 except ImportError as e:
-    st.error(f"❌ Import error: {e}")
+    st.error(f"Import error: {e}")
     st.stop()
 
-# ─────────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
 # CONSTANTS
-# ─────────────────────────────────────────────────────────────────────────────
-AE_CHECKPOINT = Path(os.getenv("AE_CHECKPOINT", "outputs/ae_model.pth"))
+# ---------------------------------------------------------------------------
+AE_CHECKPOINT = Path("outputs/ae_model.pth")
 AE_IMG_SIZE   = 128
 AE_THRESHOLD  = 0.01
 
@@ -99,18 +168,31 @@ _AE_TRANSFORM = transforms.Compose([
     transforms.ToTensor(),
 ])
 
-# ─────────────────────────────────────────────────────────────────────────────
+PCB_CLASSES = ["non_pcb", "pcb"]
+PCB_TRANSFORM = transforms.Compose([
+    transforms.Resize((224, 224)),
+    transforms.ToTensor(),
+])
+
+# ---------------------------------------------------------------------------
 # MODEL LOADERS
-# ─────────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+@st.cache_resource
+def load_pcb_classifier():
+    import timm
+    model = timm.create_model("mobilenetv3_small_100", pretrained=False, num_classes=2)
+    model.load_state_dict(torch.load("pcb_classifier.pth", map_location="cpu"))
+    model.eval()
+    return model
+
 @st.cache_resource
 def load_phase1_model():
     if not AE_CHECKPOINT.exists():
         raise FileNotFoundError(
-            f"ae_model.pth not found at: {AE_CHECKPOINT.resolve()} — "
-            f"make sure outputs/ae_model.pth is committed to GitHub."
+            f"ae_model.pth not found at: {AE_CHECKPOINT.resolve()} -- "
+            f"make sure outputs/ae_model.pth is present."
         )
     return load_ae(AE_CHECKPOINT, device=CFG.device)
-
 
 @st.cache_resource
 def load_phase2_model():
@@ -118,7 +200,6 @@ def load_phase2_model():
     load_checkpoint(CFG.CHECKPOINT, model)
     model.eval()
     return model
-
 
 @st.cache_resource
 def load_seg_model():
@@ -134,10 +215,23 @@ def load_seg_model():
         pass
     return None
 
+# ---------------------------------------------------------------------------
+# PHASE 0 - PCB VALIDATOR
+# ---------------------------------------------------------------------------
+def is_pcb_image(img_pil, threshold=0.80):
+    x = PCB_TRANSFORM(img_pil).unsqueeze(0)
+    with torch.no_grad():
+        out = PCB_MODEL(x)
+        probs = torch.softmax(out, dim=1)[0]
+    pred = probs.argmax().item()
+    confidence = probs[pred].item()
+    label = PCB_CLASSES[pred]
+    is_pcb = (label == "pcb") and (confidence > threshold)
+    return is_pcb, label, confidence
 
-# ─────────────────────────────────────────────────────────────────────────────
-# HELPERS
-# ─────────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# PHASE 1 - AUTOENCODER
+# ---------------------------------------------------------------------------
 def run_phase1(ae_model, img_pil, threshold):
     x = _AE_TRANSFORM(img_pil).unsqueeze(0).to(CFG.device)
     with torch.no_grad():
@@ -146,18 +240,18 @@ def run_phase1(ae_model, img_pil, threshold):
     is_anomaly = error > threshold
 
     recon_np = recon[0, 0].cpu().numpy()
-
-    # Auto-stretch: map actual min→max to 0→255 so it's always visible
     r_min, r_max = recon_np.min(), recon_np.max()
     if r_max > r_min:
         recon_np = (recon_np - r_min) / (r_max - r_min)
     else:
-        recon_np = np.zeros_like(recon_np)  # truly empty output
-
+        recon_np = np.zeros_like(recon_np)
     recon_np  = (recon_np * 255).astype(np.uint8)
     recon_pil = Image.fromarray(recon_np, mode="L").convert("RGB")
     return error, is_anomaly, recon_pil
 
+# ---------------------------------------------------------------------------
+# PHASE 2 - GRAD-CAM
+# ---------------------------------------------------------------------------
 def run_gradcam(model, img_pil, class_idx):
     tl     = get_gradcam_target_layer(model)
     cam    = np.zeros((CFG.img_size, CFG.img_size), dtype=np.float32)
@@ -175,115 +269,129 @@ def run_gradcam(model, img_pil, class_idx):
     return cam, bbox, img_np
 
 
+# ---------------------------------------------------------------------------
+# HELPER
+# ---------------------------------------------------------------------------
 def fig_to_pil(fig):
     buf = io.BytesIO()
     fig.savefig(buf, format="png", dpi=120, bbox_inches="tight")
     buf.seek(0)
     return Image.open(buf)
 
+# ---------------------------------------------------------------------------
+# LOAD MODELS
+# ---------------------------------------------------------------------------
+with st.spinner("Loading models..."):
+    try:
+        PCB_MODEL = load_pcb_classifier()
+        ae_model  = load_phase1_model()
+        p2_model  = load_phase2_model()
+        seg_model = load_seg_model()
+        st.sidebar.success(f"Models loaded ({CFG.device.upper()})")
+        try:
+            ckpt = torch.load(CFG.CHECKPOINT, map_location="cpu", weights_only=False)
+            if isinstance(ckpt, dict):
+                st.sidebar.metric("Phase 2 Val Acc", f"{ckpt.get('best_acc', 0):.1%}")
+                st.sidebar.metric("Trained Epochs",  str(ckpt.get("epoch", "?")))
+        except Exception:
+            pass
+    except Exception as e:
+        st.error(f"Model loading failed: {e}")
+        st.stop()
 
-# ─────────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
 # SIDEBAR
-# ─────────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
 with st.sidebar:
-    st.header("ℹ️ About")
+    st.header("About")
     st.markdown("""
-**PCB Defect Detection — 2-Phase**
+**PCB Defect Detection -- 3-Phase Pipeline**
 
-**Phase 1 — Autoencoder**
+**Phase 0 -- PCB Validator**
+MobileNetV3 binary classifier checks whether
+the uploaded image is actually a PCB.
+Non-PCB images are rejected immediately.
+
+**Phase 1 -- Autoencoder**
 Detects normal vs anomaly using
 reconstruction error threshold.
 
-**Phase 2 — MobileViT-S**
+**Phase 2 -- MobileViT-S**
 Classifies defect type and localises
 with Grad-CAM + bounding box.
+Mistral-7B via HuggingFace free API
+generates the defect explanation.
 
 **6 defect classes:**
-Missing Hole · Mouse Bite · Open Circuit
-Short · Spur · Spurious Copper
+Missing Hole | Mouse Bite | Open Circuit
+Short | Spur | Spurious Copper
 """)
     st.divider()
-    st.header("⚙️ Settings")
+    st.header("Settings")
     threshold = st.slider(
         "Phase 1 Anomaly Threshold",
         min_value=0.001, max_value=0.050,
         value=AE_THRESHOLD, step=0.001, format="%.3f",
         help="Lower = more sensitive. Higher = fewer false alarms.",
     )
+
     st.divider()
-    st.header("🔧 How to use")
+    st.header("How to use")
     st.markdown("""
 1. Upload a PCB image (JPG/PNG)
-2. Phase 1 checks normal vs anomaly
-3. If anomaly → Phase 2 classifies type
-4. Click **Generate Heatmap** for Grad-CAM
+2. **Phase 0** validates it is a PCB
+3. **Phase 1** checks normal vs anomaly
+4. If anomaly -- **Phase 2** classifies type
+5. Read the AI explanation
+6. Click **Generate Heatmap** for Grad-CAM
 """)
 
-# ─────────────────────────────────────────────────────────────────────────────
-# LOAD MODELS
-# ─────────────────────────────────────────────────────────────────────────────
-with st.spinner("Loading models…"):
-    try:
-        ae_model  = load_phase1_model()
-        p2_model  = load_phase2_model()
-        seg_model = load_seg_model()
-        st.sidebar.success(f"✅ Models loaded ({CFG.device.upper()})")
-        try:
-            ckpt = torch.load(CFG.CHECKPOINT, map_location="cpu",
-                              weights_only=False)
-            if isinstance(ckpt, dict):
-                st.sidebar.metric("Phase 2 Val Acc",
-                                  f"{ckpt.get('best_acc', 0):.1%}")
-                st.sidebar.metric("Trained Epochs",
-                                  str(ckpt.get("epoch", "?")))
-        except Exception:
-            pass
-    except Exception as e:
-        st.error(f"❌ Model loading failed: {e}")
-        st.stop()
-
-# ─────────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
 # MAIN UI
-# ─────────────────────────────────────────────────────────────────────────────
-st.title("🔍 PCB Defect Detection System")
+# ---------------------------------------------------------------------------
+st.title("PCB Defect Detection System")
 st.markdown(
-    "**Two-phase pipeline:** Autoencoder anomaly detection → MobileViT-S defect classification + Grad-CAM localisation.")
+    "**Three-phase pipeline:** PCB Validator -> Autoencoder anomaly detection -> "
+    "MobileViT-S defect classification + Grad-CAM localisation."
+)
 
 uploaded = st.file_uploader("Upload PCB Image", type=["jpg", "jpeg", "png", "bmp"])
 if not uploaded:
-    st.info("👆 Upload a PCB image to begin.")
+    st.info("Upload a PCB image to begin.")
     st.stop()
 
 img_pil = Image.open(uploaded).convert("RGB")
 
-# ── PCB Validation ────────────────────────────────────────────────────────────
+# ===========================================================================
+# PHASE 0 -- PCB VALIDATION
+# ===========================================================================
 st.markdown("---")
-st.subheader("🟢 Pre-check — Is this a PCB image?")
+st.subheader("Phase 0 -- PCB Validator")
 
-with st.spinner("Validating image…"):
+with st.spinner("Validating image..."):
     pcb_valid, pcb_label, pcb_conf = is_pcb_image(img_pil)
 
 col_img, col_result = st.columns(2)
 with col_img:
     st.image(img_pil, caption="Uploaded Image", use_container_width=True)
 with col_result:
-    st.metric("Prediction", pcb_label.upper())
-    st.metric("Confidence", f"{pcb_conf:.1%}")
+    st.metric("Prediction",  pcb_label.upper())
+    st.metric("Confidence",  f"{pcb_conf:.1%}")
 
     if pcb_valid:
-        st.success("✅ PCB detected — proceeding to Phase 1 & 2")
+        st.success("PCB detected -- proceeding to Phase 1 & 2")
     else:
-        st.error("❌ Not a PCB image")
-        st.warning("Upload a proper PCB image")
-        st.stop()    # ← HARD STOP: nothing below runs
+        st.error("Not a PCB image")
+        st.warning("Please upload a proper PCB image to continue.")
+        st.stop()
 
-# ─────────────────────────────────────────────────────────────────────────────
-# PHASE 1
-# ─────────────────────────────────────────────────────────────────────────────
+# ===========================================================================
+# PHASE 1 -- ANOMALY DETECTION
+# ===========================================================================
 st.markdown("---")
-st.subheader("🔵 Phase 1 — Anomaly Detection (Autoencoder)")
+st.subheader("Phase 1 -- Anomaly Detection (Autoencoder)")
 
-with st.spinner("Phase 1 running…"):
+with st.spinner("Phase 1 running..."):
     error, anomaly_flag, recon_pil = run_phase1(ae_model, img_pil, threshold)
 
 c1, c3 = st.columns(2)
@@ -293,7 +401,7 @@ with c3:
     st.markdown("#### Phase 1 Result")
     st.metric("Reconstruction Error", f"{error:.5f}")
     st.metric("Threshold",            f"{threshold:.3f}")
-    st.metric("Error / Threshold",    f"{error/threshold:.2f}×")
+    st.metric("Error / Threshold",    f"{error/threshold:.2f}x")
 
     pct       = min(error / (threshold * 2), 1.0)
     bar_color = "#e74c3c" if anomaly_flag else "#2ecc71"
@@ -305,23 +413,25 @@ with c3:
         unsafe_allow_html=True,
     )
     if anomaly_flag:
-        st.error("🚨 **ANOMALY DETECTED** — continuing to Phase 2")
+        st.error("ANOMALY DETECTED -- continuing to Phase 2")
     else:
-        st.success("✅ **NORMAL PCB** — no defect found")
+        st.success("NORMAL PCB -- no defect found")
         st.info("Pipeline stops here.")
         st.markdown("---")
-        st.subheader("📋 Summary")
-        st.success(f"This PCB appears **normal**. Reconstruction error ({error:.5f}) "
-                   f"is below threshold ({threshold:.3f}).")
+        st.subheader("Pipeline Summary")
+        st.success(
+            f"This PCB appears **normal**. Reconstruction error ({error:.5f}) "
+            f"is below threshold ({threshold:.3f})."
+        )
         st.stop()
 
-# ─────────────────────────────────────────────────────────────────────────────
-# PHASE 2
-# ─────────────────────────────────────────────────────────────────────────────
+# ===========================================================================
+# PHASE 2 -- DEFECT CLASSIFICATION
+# ===========================================================================
 st.markdown("---")
-st.subheader("🟠 Phase 2 — Defect Classification (MobileViT-S)")
+st.subheader("Phase 2 -- Defect Classification (MobileViT-S)")
 
-with st.spinner("Phase 2 running…"):
+with st.spinner("Phase 2 running..."):
     result = predict_tta(p2_model, img_pil)
 
 if len(result) == 4:
@@ -346,7 +456,7 @@ cp, cc = st.columns([1, 2])
 with cp:
     st.markdown("#### Prediction")
     if is_ambiguous and ambig_info:
-        st.warning("⚠️ **Ambiguous**")
+        st.warning("Ambiguous prediction")
         st.metric("Class 1", class1.replace("_"," ").title(), f"{prob1:.1%}")
         st.metric("Class 2", class2.replace("_"," ").title(), f"{prob2:.1%}")
         st.caption(f"Diff: {abs(prob1-prob2)*100:.1f}%")
@@ -376,30 +486,58 @@ with cc:
     st.pyplot(fig_bar)
     plt.close(fig_bar)
 
-# ─────────────────────────────────────────────────────────────────────────────
-# GRAD-CAM + BBOX
-# ─────────────────────────────────────────────────────────────────────────────
+# ===========================================================================
+# GEMINI EXPLANATION
+# ===========================================================================
 st.markdown("---")
-st.subheader("🔬 Defect Localisation — Grad-CAM + Bounding Box")
+st.subheader("AI Explanation & Recommended Actions")
 
-if st.button("🔥 Generate Heatmap + Bounding Box"):
-    with st.spinner("Running Grad-CAM…"):
+EXPLAIN_THRESHOLD = 0.20
+
+if confidence >= EXPLAIN_THRESHOLD or is_ambiguous:
+    if is_ambiguous:
+        st.warning(
+            "Ambiguous prediction -- model is uncertain between two defect classes. "
+            "Explanation covers both candidates."
+        )
+    with st.spinner("Asking Mistral-7B via HuggingFace..."):
+        explanation = generate_explanation(display_label, confidence)
+    st.info(explanation)
+    if confidence < 0.5:
+        st.caption(
+            f"Low confidence ({confidence:.1%}) -- verify result manually "
+            f"or upload a clearer image."
+        )
+else:
+    st.warning(
+        f"Confidence too low ({confidence:.1%}) -- skipping explanation. "
+        f"Try adjusting the Phase 1 threshold or upload a higher-quality image."
+    )
+
+# ===========================================================================
+# GRAD-CAM + BOUNDING BOX
+# ===========================================================================
+st.markdown("---")
+st.subheader("Defect Localisation -- Grad-CAM + Bounding Box")
+
+if st.button("Generate Heatmap + Bounding Box"):
+    with st.spinner("Running Grad-CAM..."):
         try:
             cam, bbox, img_np = run_gradcam(p2_model, img_pil, predicted_idx)
             box_color = (255, 165, 0) if is_ambiguous else (0, 255, 80)
-            img_box   = draw_bbox(img_np, bbox, display_label,
-                                  confidence, color=box_color)
+            img_box   = draw_bbox(img_np, bbox, display_label, confidence, color=box_color)
 
             fig_vis, axes = plt.subplots(1, 3, figsize=(16, 5))
-            title = (f"⚠ AMBIGUOUS: {display_label.upper()}"
-                     if is_ambiguous
-                     else f"Defect: {label.replace('_',' ').upper()}  |  "
-                          f"Confidence: {confidence:.1%}")
+            title = (
+                f"AMBIGUOUS: {display_label.upper()}"
+                if is_ambiguous
+                else f"Defect: {label.replace('_',' ').upper()}  |  Confidence: {confidence:.1%}"
+            )
             fig_vis.suptitle(title, fontsize=13, fontweight="bold",
                              color="#e67e22" if is_ambiguous else "#c0392b")
-            axes[0].imshow(img_np);                  axes[0].set_title("Original");    axes[0].axis("off")
+            axes[0].imshow(img_np);                         axes[0].set_title("Original");    axes[0].axis("off")
             axes[1].imshow(overlay(img_np, cam, alpha=0.55)); axes[1].set_title("Grad-CAM"); axes[1].axis("off")
-            axes[2].imshow(img_box);                 axes[2].set_title("Bounding Box"); axes[2].axis("off")
+            axes[2].imshow(img_box);                        axes[2].set_title("Bounding Box"); axes[2].axis("off")
             plt.tight_layout()
             st.image(fig_to_pil(fig_vis), use_container_width=True)
             plt.close(fig_vis)
@@ -407,8 +545,10 @@ if st.button("🔥 Generate Heatmap + Bounding Box"):
             if bbox:
                 x1, y1, x2, y2 = bbox
                 w, h = x2-x1, y2-y1
-                st.info(f"📦 **Bbox:** ({x1},{y1}) → ({x2},{y2})  |  "
-                        f"Size: {w}×{h} px  |  Area: {w*h} px²")
+                st.info(
+                    f"Bbox: ({x1},{y1}) -> ({x2},{y2})  |  "
+                    f"Size: {w}x{h} px  |  Area: {w*h} px^2"
+                )
             else:
                 st.warning("No bounding box detected.")
 
@@ -417,22 +557,28 @@ if st.button("🔥 Generate Heatmap + Bounding Box"):
             import traceback
             st.code(traceback.format_exc())
 
-# ─────────────────────────────────────────────────────────────────────────────
+# ===========================================================================
 # PIPELINE SUMMARY
-# ─────────────────────────────────────────────────────────────────────────────
+# ===========================================================================
 st.markdown("---")
-st.subheader("📋 Pipeline Summary")
-cs1, cs2 = st.columns(2)
+st.subheader("Pipeline Summary")
+cs1, cs2, cs3 = st.columns(3)
 with cs1:
-    st.markdown("**Phase 1 — Autoencoder**")
+    st.markdown("**Phase 0 -- PCB Validator**")
     st.table({
-        "Metric": ["Reconstruction Error", "Threshold", "Result"],
-        "Value":  [f"{error:.5f}", f"{threshold:.3f}", "ANOMALY ⚠"],
+        "Metric": ["Prediction", "Confidence", "Result"],
+        "Value":  [pcb_label.upper(), f"{pcb_conf:.1%}", "VALID PCB"],
     })
 with cs2:
-    st.markdown("**Phase 2 — MobileViT-S**")
+    st.markdown("**Phase 1 -- Autoencoder**")
+    st.table({
+        "Metric": ["Reconstruction Error", "Threshold", "Result"],
+        "Value":  [f"{error:.5f}", f"{threshold:.3f}", "ANOMALY"],
+    })
+with cs3:
+    st.markdown("**Phase 2 -- MobileViT-S**")
     st.table({
         "Metric": ["Predicted Class", "Confidence", "Ambiguous"],
         "Value":  [display_label, f"{confidence:.1%}",
-                   "Yes ⚠" if is_ambiguous else "No ✔"],
+                   "Yes" if is_ambiguous else "No"],
     })
